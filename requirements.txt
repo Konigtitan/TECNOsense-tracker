@@ -1,0 +1,10 @@
+# Firebase
+firebase-admin==6.5.0
+
+# Dashboard & Data Analysis
+streamlit==1.35.0
+streamlit-autorefresh==1.0.1
+pandas==2.2.2
+scikit-learn==1.5.0
+plotly==5.22.0
+numpy==1.26.4
