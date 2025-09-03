@@ -96,7 +96,7 @@ This command will start the web server and open the TECNOSense dashboard in your
 streamlit run dashboard.py
 ```
 
-You can now interact with the dashboard. Click the "Refresh Now" button to see the latest data from the live simulator.
+You can now interact with the dashboard. Click the "Refresh Now" button to see the latest data from live simulator.
 
 ---
 
