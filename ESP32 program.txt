@@ -1,0 +1,595 @@
+
+#include <WiFi.h>
+#include <PubSubClient.h>
+#include <Wire.h>
+#include <BH1750.h>
+#include <ArduinoJson.h>
+
+// ==================== CONFIGURATION ====================
+// Network Configuration
+const char* WIFI_SSID = "CAMPUS_WIFI";
+const char* WIFI_PASSWORD = "WIFI_PASSWORD";
+const char* MQTT_SERVER = "192.168.1.100";
+const int MQTT_PORT = 1883;
+const char* MQTT_USER = "esp32";
+const char* MQTT_PASSWORD = "password";
+
+// Device Identity
+const char* BUILDING = "building_1";
+const char* ROOM = "room_203";
+const char* DEVICE_ID = "esp32_smart_node_1";
+
+// Pin Configuration
+#define RELAY_LIGHT 2
+#define RELAY_AC 3
+#define RELAY_FAN 4
+#define IR_BREAKBEAM_PIN 1
+#define RADAR_RX_PIN 43
+#define RADAR_TX_PIN 44
+
+// Sensor Thresholds
+#define LUX_THRESHOLD 200
+#define RADAR_ENERGY_THRESHOLD 50
+#define MOVEMENT_TIMEOUT 15000        // 15 seconds
+#define DOOR_DEBOUNCE_TIME 300        // 300ms debounce
+#define OCCUPANCY_TIMEOUT 60000       // 1 minute timeout
+#define MAX_PEOPLE 15
+
+// ==================== GLOBAL OBJECTS ====================
+WiFiClient espClient;
+PubSubClient mqttClient(espClient);
+BH1750 lightSensor;
+HardwareSerial radarSerial(1);
+
+// ==================== DATA STRUCTURES ====================
+struct DeviceStatus {
+  bool lightOn = false;
+  bool acOn = false;
+  bool fanOn = false;
+  bool autoMode = true;
+  int peopleCount = 0;
+  float lightLevel = 0;
+  bool isOccupied = false;
+};
+
+struct SensorReadings {
+  float lux = 0;
+  bool radarPresence = false;
+  bool doorBeamBroken = false;
+  int radarEnergyLevel = 0;
+};
+
+struct OccupancyTracker {
+  unsigned long lastMovementTime = 0;
+  unsigned long lastDoorEventTime = 0;
+  bool lastBeamState = false;
+  bool pendingEntry = false;
+  bool pendingExit = false;
+  unsigned long entryStartTime = 0;
+  unsigned long exitStartTime = 0;
+};
+
+// ==================== GLOBAL VARIABLES ====================
+DeviceStatus deviceStatus;
+SensorReadings sensors;
+OccupancyTracker occupancy;
+
+// MQTT Topics
+String topicOccupancy;
+String topicLightLevel;
+String topicStatus;
+String topicLightSet;
+String topicAcSet;
+String topicFanSet;
+String topicModeSet;
+String topicDeviceStatus;
+
+// Timing Variables
+unsigned long lastSensorPublish = 0;
+unsigned long lastStatusPublish = 0;
+volatile bool doorEventTriggered = false;
+volatile unsigned long lastIrTime = 0;
+
+// Radar Variables
+bool radarConnected = false;
+unsigned long lastRadarRead = 0;
+
+// ==================== INTERRUPT HANDLER ====================
+void IRAM_ATTR doorSensorISR() {
+  unsigned long currentTime = millis();
+  if (currentTime - lastIrTime > DOOR_DEBOUNCE_TIME) {
+    doorEventTriggered = true;
+    lastIrTime = currentTime;
+  }
+}
+
+// ==================== RADAR FUNCTIONS ====================
+void initializeRadar() {
+  radarSerial.begin(256000, SERIAL_8N1, RADAR_RX_PIN, RADAR_TX_PIN);
+  delay(200);
+  
+  // Send initialization commands
+  uint8_t enableCmd[] = {0xFD, 0xFC, 0xFB, 0xFA, 0x04, 0x00, 0xFF, 0x00, 0x01, 0x00, 0x04, 0x03, 0x02, 0x01};
+  radarSerial.write(enableCmd, sizeof(enableCmd));
+  delay(100);
+  
+  radarConnected = true;
+  Serial.println("✓ Radar initialized");
+}
+
+void readRadar() {
+  if (!radarConnected || (millis() - lastRadarRead < 100)) return;
+  
+  lastRadarRead = millis();
+  sensors.radarEnergyLevel = 0;
+  sensors.radarPresence = false;
+  
+  // Read available data
+  int bytesAvailable = radarSerial.available();
+  if (bytesAvailable > 10) {
+    uint8_t buffer[64];
+    int bytesRead = min(bytesAvailable, 64);
+    
+    for (int i = 0; i < bytesRead; i++) {
+      if (radarSerial.available()) {
+        buffer[i] = radarSerial.read();
+      }
+    }
+    
+    // Simple parsing for presence and energy
+    for (int i = 0; i < bytesRead - 4; i++) {
+      if (buffer[i] == 0xF4 && buffer[i+1] == 0xF3 && buffer[i+2] == 0xF2 && buffer[i+3] == 0xF1) {
+        // Found data frame
+        if (i + 8 < bytesRead) {
+          int energyValue = (buffer[i+6] << 8) | buffer[i+5];
+          if (energyValue > sensors.radarEnergyLevel) {
+            sensors.radarEnergyLevel = energyValue;
+          }
+          
+          if (energyValue > RADAR_ENERGY_THRESHOLD) {
+            sensors.radarPresence = true;
+          }
+        }
+        break;
+      }
+    }
+  }
+  
+  // Alternative: Simple presence detection based on serial activity
+  if (!sensors.radarPresence && bytesAvailable > 20) {
+    sensors.radarPresence = true;
+    sensors.radarEnergyLevel = 100; // Default value when presence detected
+  }
+}
+
+// ==================== INITIALIZATION FUNCTIONS ====================
+void initializeTopics() {
+  topicOccupancy = "campus/" + String(BUILDING) + "/" + String(ROOM) + "/occupancy";
+  topicLightLevel = "campus/" + String(BUILDING) + "/" + String(ROOM) + "/light_level";
+  topicStatus = "campus/" + String(BUILDING) + "/" + String(ROOM) + "/status";
+  topicLightSet = "campus/" + String(BUILDING) + "/" + String(ROOM) + "/light/set";
+  topicAcSet = "campus/" + String(BUILDING) + "/" + String(ROOM) + "/ac/set";
+  topicFanSet = "campus/" + String(BUILDING) + "/" + String(ROOM) + "/fan/set";
+  topicModeSet = "campus/" + String(BUILDING) + "/" + String(ROOM) + "/mode/set";
+  topicDeviceStatus = "campus/" + String(BUILDING) + "/" + String(ROOM) + "/device_status";
+}
+
+void initializeWiFi() {
+  Serial.print("Connecting to WiFi");
+  WiFi.mode(WIFI_STA);
+  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+
+  int attempts = 0;
+  while (WiFi.status() != WL_CONNECTED && attempts < 30) {
+    delay(500);
+    Serial.print(".");
+    attempts++;
+  }
+
+  if (WiFi.status() == WL_CONNECTED) {
+    Serial.println("\nWiFi connected!");
+    Serial.print("IP: ");
+    Serial.println(WiFi.localIP());
+  } else {
+    Serial.println("\nWiFi connection failed - continuing offline");
+  }
+}
+
+void initializeMQTT() {
+  mqttClient.setServer(MQTT_SERVER, MQTT_PORT);
+  mqttClient.setCallback(handleMqttMessage);
+  mqttClient.setBufferSize(1024);
+}
+
+void initializeSensors() {
+  Serial.println("Initializing sensors...");
+  
+  // Initialize Light Sensor
+  Wire.begin(8, 9);
+  if (lightSensor.begin(BH1750::CONTINUOUS_HIGH_RES_MODE)) {
+    Serial.println("✓ Light sensor initialized");
+  } else {
+    Serial.println("✗ Light sensor failed");
+  }
+  
+  // Initialize Radar
+  initializeRadar();
+  
+  // Initialize IR Sensor
+  pinMode(IR_BREAKBEAM_PIN, INPUT_PULLUP);
+  attachInterrupt(digitalPinToInterrupt(IR_BREAKBEAM_PIN), doorSensorISR, CHANGE);
+  Serial.println("✓ IR breakbeam sensor initialized");
+  
+  // Initialize Relays
+  pinMode(RELAY_LIGHT, OUTPUT);
+  pinMode(RELAY_AC, OUTPUT);
+  pinMode(RELAY_FAN, OUTPUT);
+  digitalWrite(RELAY_LIGHT, LOW);
+  digitalWrite(RELAY_AC, LOW);
+  digitalWrite(RELAY_FAN, LOW);
+  Serial.println("✓ Relays initialized");
+}
+
+// ==================== MQTT FUNCTIONS ====================
+void connectMQTT() {
+  if (WiFi.status() != WL_CONNECTED) return;
+  
+  while (!mqttClient.connected()) {
+    Serial.print("Connecting to MQTT...");
+    
+    if (mqttClient.connect(DEVICE_ID, MQTT_USER, MQTT_PASSWORD, 
+                          topicStatus.c_str(), 0, true, "offline")) {
+      Serial.println(" connected!");
+      
+      // Publish online status
+      mqttClient.publish(topicStatus.c_str(), "online", true);
+      
+      // Subscribe to control topics
+      mqttClient.subscribe(topicLightSet.c_str());
+      mqttClient.subscribe(topicAcSet.c_str());
+      mqttClient.subscribe(topicFanSet.c_str());
+      mqttClient.subscribe(topicModeSet.c_str());
+      
+      Serial.println("Subscribed to control topics");
+    } else {
+      Serial.print(" failed, rc=");
+      Serial.println(mqttClient.state());
+      delay(3000);
+    }
+  }
+}
+
+void handleMqttMessage(char* topic, byte* payload, unsigned int length) {
+  payload[length] = '\0';
+  String message = String((char*)payload);
+  String topicStr = String(topic);
+  
+  Serial.printf("MQTT [%s]: %s\n", topic, message.c_str());
+  
+  if (topicStr == topicLightSet) {
+    handleLightControl(message);
+  } else if (topicStr == topicAcSet) {
+    handleAcControl(message);
+  } else if (topicStr == topicFanSet) {
+    handleFanControl(message);
+  } else if (topicStr == topicModeSet) {
+    handleModeControl(message);
+  }
+}
+
+void handleLightControl(const String& command) {
+  if (command == "ON") {
+    deviceStatus.lightOn = true;
+    deviceStatus.autoMode = false;
+    digitalWrite(RELAY_LIGHT, HIGH);
+    Serial.println("Light manually ON");
+  } else if (command == "OFF") {
+    deviceStatus.lightOn = false;
+    deviceStatus.autoMode = false;
+    digitalWrite(RELAY_LIGHT, LOW);
+    Serial.println("Light manually OFF");
+  }
+}
+
+void handleAcControl(const String& command) {
+  if (command == "ON") {
+    deviceStatus.acOn = true;
+    deviceStatus.autoMode = false;
+    digitalWrite(RELAY_AC, HIGH);
+    Serial.println("AC manually ON");
+  } else if (command == "OFF") {
+    deviceStatus.acOn = false;
+    deviceStatus.autoMode = false;
+    digitalWrite(RELAY_AC, LOW);
+    Serial.println("AC manually OFF");
+  }
+}
+
+void handleFanControl(const String& command) {
+  if (command == "ON") {
+    deviceStatus.fanOn = true;
+    deviceStatus.autoMode = false;
+    digitalWrite(RELAY_FAN, HIGH);
+    Serial.println("Fan manually ON");
+  } else if (command == "OFF") {
+    deviceStatus.fanOn = false;
+    deviceStatus.autoMode = false;
+    digitalWrite(RELAY_FAN, LOW);
+    Serial.println("Fan manually OFF");
+  }
+}
+
+void handleModeControl(const String& command) {
+  if (command == "AUTO") {
+    deviceStatus.autoMode = true;
+    Serial.println("Auto mode enabled");
+  } else if (command == "MANUAL") {
+    deviceStatus.autoMode = false;
+    Serial.println("Manual mode enabled");
+  }
+}
+
+// ==================== SENSOR READING FUNCTIONS ====================
+void readSensors() {
+  // Read light sensor
+  sensors.lux = lightSensor.readLightLevel();
+  if (sensors.lux < 0) sensors.lux = 0;
+  deviceStatus.lightLevel = sensors.lux;
+  
+  // Read radar
+  readRadar();
+  
+  // Read door beam state
+  sensors.doorBeamBroken = (digitalRead(IR_BREAKBEAM_PIN) == LOW);
+}
+
+// ==================== OCCUPANCY DETECTION ====================
+void processOccupancyDetection() {
+  unsigned long currentTime = millis();
+  
+  // Handle door sensor events
+  if (doorEventTriggered) {
+    processDoorEvent(currentTime);
+    doorEventTriggered = false;
+  }
+  
+  // Update movement tracking
+  if (sensors.radarPresence) {
+    occupancy.lastMovementTime = currentTime;
+  }
+  
+  // Process door crossing logic
+  processDoorCrossing(currentTime);
+  
+  // Timeout check - clear room if no movement for extended period
+  if (deviceStatus.peopleCount > 0 && 
+      (currentTime - occupancy.lastMovementTime > OCCUPANCY_TIMEOUT)) {
+    Serial.println("Occupancy timeout - clearing room");
+    deviceStatus.peopleCount = 0;
+    deviceStatus.isOccupied = false;
+  }
+  
+  // Update occupancy status
+  deviceStatus.isOccupied = (deviceStatus.peopleCount > 0) || 
+                           (currentTime - occupancy.lastMovementTime < MOVEMENT_TIMEOUT);
+}
+
+void processDoorEvent(unsigned long currentTime) {
+  bool currentBeamState = sensors.doorBeamBroken;
+  
+  Serial.printf("Door beam %s (Energy: %d)\n", 
+                currentBeamState ? "BROKEN" : "RESTORED", 
+                sensors.radarEnergyLevel);
+  
+  occupancy.lastDoorEventTime = currentTime;
+  occupancy.lastBeamState = currentBeamState;
+}
+
+void processDoorCrossing(unsigned long currentTime) {
+  // Entry Detection Logic
+  if (sensors.doorBeamBroken && sensors.radarPresence && !occupancy.pendingEntry && !occupancy.pendingExit) {
+    // Someone is at the door with radar detection
+    if (deviceStatus.peopleCount == 0 || sensors.radarEnergyLevel > RADAR_ENERGY_THRESHOLD * 1.5) {
+      // Likely entry (empty room or strong signal suggesting entry)
+      occupancy.pendingEntry = true;
+      occupancy.entryStartTime = currentTime;
+      Serial.println("Entry sequence started");
+    } else {
+      // Likely exit
+      occupancy.pendingExit = true;
+      occupancy.exitStartTime = currentTime;
+      Serial.println("Exit sequence started");
+    }
+  }
+  
+  // Complete Entry
+  if (occupancy.pendingEntry && !sensors.doorBeamBroken) {
+    if (currentTime - occupancy.entryStartTime > DOOR_DEBOUNCE_TIME && 
+        currentTime - occupancy.entryStartTime < 3000) { // Complete within 3 seconds
+      deviceStatus.peopleCount = min(deviceStatus.peopleCount + 1, MAX_PEOPLE);
+      occupancy.lastMovementTime = currentTime;
+      Serial.printf("Entry confirmed - Count: %d\n", deviceStatus.peopleCount);
+    }
+    occupancy.pendingEntry = false;
+    occupancy.entryStartTime = 0;
+  }
+  
+  // Complete Exit
+  if (occupancy.pendingExit && !sensors.doorBeamBroken) {
+    if (currentTime - occupancy.exitStartTime > DOOR_DEBOUNCE_TIME && 
+        currentTime - occupancy.exitStartTime < 3000) { // Complete within 3 seconds
+      deviceStatus.peopleCount = max(deviceStatus.peopleCount - 1, 0);
+      Serial.printf("Exit confirmed - Count: %d\n", deviceStatus.peopleCount);
+    }
+    occupancy.pendingExit = false;
+    occupancy.exitStartTime = 0;
+  }
+  
+  // Clear stuck pending states
+  if (occupancy.pendingEntry && (currentTime - occupancy.entryStartTime > 5000)) {
+    Serial.println("Entry timeout - clearing");
+    occupancy.pendingEntry = false;
+    occupancy.entryStartTime = 0;
+  }
+  
+  if (occupancy.pendingExit && (currentTime - occupancy.exitStartTime > 5000)) {
+    Serial.println("Exit timeout - clearing");
+    occupancy.pendingExit = false;
+    occupancy.exitStartTime = 0;
+  }
+}
+
+// ==================== AUTOMATION CONTROL ====================
+void applyAutomationLogic() {
+  if (!deviceStatus.autoMode) return;
+  
+  static unsigned long lightOffDelay = 0;
+  
+  // Light Control with hysteresis
+  bool shouldLightBeOn = deviceStatus.isOccupied && (sensors.lux < LUX_THRESHOLD);
+  
+  if (shouldLightBeOn && !deviceStatus.lightOn) {
+    deviceStatus.lightOn = true;
+    digitalWrite(RELAY_LIGHT, HIGH);
+    lightOffDelay = 0;
+    Serial.println("Auto: Light ON");
+  } else if (!shouldLightBeOn && deviceStatus.lightOn) {
+    // Add delay before turning off
+    if (lightOffDelay == 0) {
+      lightOffDelay = millis();
+    } else if (millis() - lightOffDelay > 10000) { // 10 second delay
+      deviceStatus.lightOn = false;
+      digitalWrite(RELAY_LIGHT, LOW);
+      lightOffDelay = 0;
+      Serial.println("Auto: Light OFF");
+    }
+  } else if (shouldLightBeOn && lightOffDelay > 0) {
+    lightOffDelay = 0; // Cancel delayed off if conditions change
+  }
+  
+  // Fan Control
+  bool shouldFanBeOn = deviceStatus.isOccupied;
+  
+  if (shouldFanBeOn != deviceStatus.fanOn) {
+    deviceStatus.fanOn = shouldFanBeOn;
+    digitalWrite(RELAY_FAN, shouldFanBeOn ? HIGH : LOW);
+    Serial.printf("Auto: Fan %s\n", shouldFanBeOn ? "ON" : "OFF");
+  }
+  
+  // AC Control (based on occupancy level)
+  bool shouldAcBeOn = deviceStatus.peopleCount >= 3; // AC on if 3+ people
+  
+  if (shouldAcBeOn != deviceStatus.acOn) {
+    deviceStatus.acOn = shouldAcBeOn;
+    digitalWrite(RELAY_AC, shouldAcBeOn ? HIGH : LOW);
+    Serial.printf("Auto: AC %s (Count: %d)\n", shouldAcBeOn ? "ON" : "OFF", deviceStatus.peopleCount);
+  }
+}
+
+// ==================== DATA PUBLISHING ====================
+void publishSensorData() {
+  if (!mqttClient.connected()) return;
+  
+  // Publish occupancy data
+  StaticJsonDocument<300> occupancyDoc;
+  occupancyDoc["count"] = deviceStatus.peopleCount;
+  occupancyDoc["occupied"] = deviceStatus.isOccupied;
+  occupancyDoc["radar_presence"] = sensors.radarPresence;
+  occupancyDoc["radar_energy"] = sensors.radarEnergyLevel;
+  occupancyDoc["door_beam"] = sensors.doorBeamBroken;
+  occupancyDoc["timestamp"] = millis();
+  
+  char occupancyBuffer[300];
+  serializeJson(occupancyDoc, occupancyBuffer);
+  mqttClient.publish(topicOccupancy.c_str(), occupancyBuffer, true);
+  
+  // Publish light level
+  mqttClient.publish(topicLightLevel.c_str(), String(sensors.lux, 1).c_str(), true);
+  
+  // Debug output
+  Serial.printf("Data - Count: %d, Occupied: %s, Lux: %.1f, Radar: %s (E:%d)\n", 
+                deviceStatus.peopleCount, 
+                deviceStatus.isOccupied ? "Yes" : "No", 
+                sensors.lux,
+                sensors.radarPresence ? "Yes" : "No",
+                sensors.radarEnergyLevel);
+}
+
+void publishDeviceStatus() {
+  if (!mqttClient.connected()) return;
+  
+  StaticJsonDocument<400> statusDoc;
+  statusDoc["device_id"] = DEVICE_ID;
+  statusDoc["room"] = ROOM;
+  statusDoc["building"] = BUILDING;
+  statusDoc["auto_mode"] = deviceStatus.autoMode;
+  statusDoc["light_on"] = deviceStatus.lightOn;
+  statusDoc["ac_on"] = deviceStatus.acOn;
+  statusDoc["fan_on"] = deviceStatus.fanOn;
+  statusDoc["wifi_connected"] = (WiFi.status() == WL_CONNECTED);
+  statusDoc["wifi_rssi"] = WiFi.RSSI();
+  statusDoc["free_heap"] = ESP.getFreeHeap();
+  statusDoc["uptime"] = millis() / 1000;
+  statusDoc["radar_connected"] = radarConnected;
+  statusDoc["pending_entry"] = occupancy.pendingEntry;
+  statusDoc["pending_exit"] = occupancy.pendingExit;
+  
+  char statusBuffer[400];
+  serializeJson(statusDoc, statusBuffer);
+  mqttClient.publish(topicDeviceStatus.c_str(), statusBuffer, false);
+}
+
+// ==================== MAIN PROGRAM ====================
+void setup() {
+  Serial.begin(115200);
+  delay(1000);
+  
+  Serial.println("\n=== TECNOsense Smart Controller v2.0 ===");
+  Serial.printf("Device: %s | Room: %s | Building: %s\n", DEVICE_ID, ROOM, BUILDING);
+  
+  // Initialize all systems
+  initializeTopics();
+  initializeSensors();
+  initializeWiFi();
+  initializeMQTT();
+  
+  Serial.println("=== System Ready ===");
+  Serial.printf("Occupancy timeout: %d seconds\n", OCCUPANCY_TIMEOUT / 1000);
+  Serial.printf("Light threshold: %d lux\n", LUX_THRESHOLD);
+  Serial.printf("Radar energy threshold: %d\n", RADAR_ENERGY_THRESHOLD);
+}
+
+void loop() {
+  // Maintain network connections
+  if (WiFi.status() == WL_CONNECTED) {
+    if (!mqttClient.connected()) {
+      connectMQTT();
+    }
+    mqttClient.loop();
+  }
+  
+  // Read all sensors
+  readSensors();
+  
+  // Process occupancy detection
+  processOccupancyDetection();
+  
+  // Apply automation logic
+  applyAutomationLogic();
+  
+  // Publish sensor data every 5 seconds
+  unsigned long currentTime = millis();
+  if (currentTime - lastSensorPublish >= 5000) {
+    publishSensorData();
+    lastSensorPublish = currentTime;
+  }
+  
+  // Publish device status every 30 seconds
+  if (currentTime - lastStatusPublish >= 30000) {
+    publishDeviceStatus();
+    lastStatusPublish = currentTime;
+  }
+  
+  // Small delay to prevent watchdog issues
+  delay(50);
+}
