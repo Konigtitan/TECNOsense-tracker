@@ -85,28 +85,7 @@ pip install -r requirements.txt
 
 ---
 
-## Running the Application
-
-To run the full TECNOSense platform, you will need to run two scripts in separate terminals.
-
-### Terminal 1: Run the Data Simulator
-
-This script populates your Firebase database with historical data and then begins simulating live sensor readings.
-
-> **Note:** The first time you run the `backfill` script, it will generate 30 days of historical data. This is a one-time process. Subsequent runs of the `live` simulator will pick up from the current time.
-
-```bash
-# Ensure your virtual environment is activated
-# (venv) ... >
-
-# (Optional, run only once) Populate 30 days of history
-python backfill.py
-
-# Run the live simulator
-python simulate.py
-```
-
-### Terminal 2: Run the Streamlit Dashboard
+## Run the Streamlit Dashboard
 
 This command will start the web server and open the TECNOSense dashboard in your browser.
 
@@ -117,7 +96,7 @@ This command will start the web server and open the TECNOSense dashboard in your
 streamlit run dashboard.py
 ```
 
-You can now interact with the dashboard. Click the "Refresh Now" button to see the latest data from the live simulator.
+You can now interact with the dashboard. Click the "Refresh Now" button to see the latest data from live simulator.
 
 ---
 
@@ -125,9 +104,8 @@ You can now interact with the dashboard. Click the "Refresh Now" button to see t
 
 ```
 .
-├── backfill.py     # One-time script to create 30-day historical data.
-├── simulate.py   # Intelligent live data simulator.
 ├── dashboard.py              # The main Streamlit dashboard application.
+├── ESP32 program.txt         # ESP32 program.
 ├── firebase_credentials.json # (Ignored by Git) Your secret Firebase key.
 ├── requirements.txt          # List of all Python dependencies.
 └── README.md                 # This file.

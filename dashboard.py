@@ -214,7 +214,7 @@ def generate_mock_fallback_data():
             'avg_humidity': np.random.uniform(35, 75),
             'is_occupied': base_occupancy > 0,
             'is_smoke_detected': False
-        })
+        }) 
     
     return current_data, pd.DataFrame(historical_data)
 
