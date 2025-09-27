@@ -241,6 +241,18 @@ void runSmartAutomation() {
     saveState();
   }
 }
+
+// Enhanced auto mode handler
+void handleAutoMode() {
+  if (!room.autoMode) {
+    // Manual mode - devices are controlled by user, no automation
+    return;
+  }
+  
+  // Auto mode - run smart automation
+  runSmartAutomation();
+}
+
 // ENHANCED SERIAL INTERFACE
 // Live status display with multiple modes
 void updateSerialDisplay() {
@@ -309,13 +321,14 @@ void displayDetailedStatus() {
 }
 
 void displayMinimalStatus() {
-  Serial.printf("Room: %s(%d) | Light:%.0f | Devices: L:%s F:%s AC:%s",
+  Serial.printf("Room: %s(%d) | Light:%.0f | Devices: L:%s F:%s AC:%s | Mode:%s",
                 room.occupied ? "OCCUPIED" : "vacant",
                 room.confidence,
                 room.lightLevel,
                 room.lightOn ? "●" : "○",
                 room.fanOn ? "●" : "○",
-                room.acOn ? "●" : "○");
+                room.acOn ? "●" : "○",
+                room.autoMode ? "AUTO" : "MANUAL");
 }
 
 const char* getOccupancyText() {
@@ -639,27 +652,33 @@ void handleNotFound() {
 
 // Device control functions
 void toggleLight() {
+  room.autoMode = false;  // Switch to manual mode when user controls device
   room.lightOn = !room.lightOn;
   digitalWrite(Config::RELAY_LIGHT, room.lightOn);
-  room.autoMode = false;
   saveState();
-  Serial.printf("💡 Light: %s (Manual Mode)\n", room.lightOn ? "ON" : "OFF");
+  Serial.printf("💡 Light: %s | Mode: %s\n", 
+                room.lightOn ? "ON" : "OFF",
+                room.autoMode ? "AUTO" : "MANUAL");
 }
 
 void toggleFan() {
+  room.autoMode = false;  // Switch to manual mode
   room.fanOn = !room.fanOn;
   digitalWrite(Config::RELAY_FAN, room.fanOn);
-  room.autoMode = false;
   saveState();
-  Serial.printf("🌀 Fan: %s (Manual Mode)\n", room.fanOn ? "ON" : "OFF");
+  Serial.printf("🌀 Fan: %s | Mode: %s\n", 
+                room.fanOn ? "ON" : "OFF",
+                room.autoMode ? "AUTO" : "MANUAL");
 }
 
 void toggleAC() {
+  room.autoMode = false;  // Switch to manual mode
   room.acOn = !room.acOn;
   digitalWrite(Config::RELAY_AC, room.acOn);
-  room.autoMode = false;
   saveState();
-  Serial.printf("❄️  AC: %s (Manual Mode)\n", room.acOn ? "ON" : "OFF");
+  Serial.printf("❄️  AC: %s | Mode: %s\n", 
+                room.acOn ? "ON" : "OFF",
+                room.autoMode ? "AUTO" : "MANUAL");
 }
 
 void toggleAutoMode() {
@@ -681,14 +700,16 @@ void printWiFiStatus() {
 }
 
 void setupWebServer() {
-  // Add this before your endpoints:
+  // Enable CORS for web interface
   server.enableCORS(true);
   server.enableCrossOrigin(true);
+  
   // Add a root endpoint for testing
   server.on("/", HTTP_GET, []() {
     sendCORSHeaders();
     server.send(200, "text/plain", "ESP32 Room Control API v3.1 - Server is running");
   });
+  
   // Add API test endpoint
   server.on("/api/test", HTTP_GET, []() {
     sendCORSHeaders();
@@ -700,14 +721,17 @@ void setupWebServer() {
     serializeJson(doc, response);
     server.send(200, "application/json", response);
   });
+  
   server.on("/api/status", HTTP_OPTIONS, handleOptions);
   server.on("/api/toggle/light", HTTP_OPTIONS, handleOptions);
   server.on("/api/toggle/fan", HTTP_OPTIONS, handleOptions);
   server.on("/api/toggle/ac", HTTP_OPTIONS, handleOptions);
   server.on("/api/toggle/auto", HTTP_OPTIONS, handleOptions);
+  
   server.on("/api/status", HTTP_GET, []() {
     unsigned long startTime = millis();
     room.totalRequests++;
+    
     DynamicJsonDocument doc(Config::MAX_JSON_SIZE);
     doc["occupied"] = room.occupied;
     doc["confidence"] = room.confidence;
@@ -716,50 +740,63 @@ void setupWebServer() {
     doc["light_level"] = round(room.lightLevel * 10) / 10.0;
     doc["radar_distance"] = room.radarDistance;
     doc["radar_readings"] = room.radarReadings;
+    
+    // Ensure devices object includes ALL states
     JsonObject devices = doc.createNestedObject("devices");
     devices["light"] = room.lightOn;
     devices["fan"] = room.fanOn;
     devices["ac"] = room.acOn;
-    devices["auto_mode"] = room.autoMode;
+    devices["auto_mode"] = room.autoMode;  // Critical: include auto mode state
+    
     doc["uptime"] = (millis() - room.bootTime) / 1000;
     doc["free_heap"] = ESP.getFreeHeap();
     doc["ip"] = room.ipAddress;
     doc["wifi_connected"] = room.wifiConnected;
     doc["ap_mode"] = room.apMode;
+    
     JsonObject health = doc.createNestedObject("health");
     health["total_requests"] = room.totalRequests;
     health["error_count"] = room.errorCount;
     health["avg_response_ms"] = round(room.avgResponseTime * 10) / 10.0;
     health["wifi_rssi"] = room.wifiConnected ? WiFi.RSSI() : 0;
+    
     String response;
     serializeJson(doc, response);
     sendCORSHeaders();
     server.send(200, F("application/json"), response);
+    
     // Update response time
     unsigned long responseTime = millis() - startTime;
     room.avgResponseTime = (room.avgResponseTime + responseTime) / 2.0;
   });
+  
   server.on("/api/toggle/light", HTTP_POST, []() {
     toggleLight();
     sendCORSHeaders();
     server.send(200, F("application/json"), 
                 String("{\"status\":\"ok\",\"device\":\"light\",\"state\":") + 
-                (room.lightOn ? "true" : "false") + "}");
+                (room.lightOn ? "true" : "false") + 
+                ",\"auto_mode\":" + (room.autoMode ? "true" : "false") + "}");
   });
+  
   server.on("/api/toggle/fan", HTTP_POST, []() {
     toggleFan();
     sendCORSHeaders();
     server.send(200, F("application/json"), 
                 String("{\"status\":\"ok\",\"device\":\"fan\",\"state\":") + 
-                (room.fanOn ? "true" : "false") + "}");
+                (room.fanOn ? "true" : "false") + 
+                ",\"auto_mode\":" + (room.autoMode ? "true" : "false") + "}");
   });
+  
   server.on("/api/toggle/ac", HTTP_POST, []() {
     toggleAC();
     sendCORSHeaders();
     server.send(200, F("application/json"), 
                 String("{\"status\":\"ok\",\"device\":\"ac\",\"state\":") + 
-                (room.acOn ? "true" : "false") + "}");
+                (room.acOn ? "true" : "false") + 
+                ",\"auto_mode\":" + (room.autoMode ? "true" : "false") + "}");
   });
+  
   server.on("/api/toggle/auto", HTTP_POST, []() {
     toggleAutoMode();
     sendCORSHeaders();
@@ -767,6 +804,7 @@ void setupWebServer() {
                 String("{\"status\":\"ok\",\"mode\":\"") + 
                 (room.autoMode ? "auto" : "manual") + "\"}");
   });
+  
   server.onNotFound(handleNotFound);
   server.begin();
   Serial.printf("🌐 Web server started on port 80 | IP: %s\n", room.ipAddress.c_str());
@@ -823,7 +861,7 @@ void loop() {
   if (now - lastSensorRead >= Config::SENSOR_INTERVAL) {
     readSensorsEnhanced();
     calculateConfidence();
-    runSmartAutomation();
+    handleAutoMode();  // Use enhanced auto mode handler
     updateSystemHealth();
     lastSensorRead = now;
   }
