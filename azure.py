@@ -11,8 +11,6 @@ from typing import Optional, Dict, Any
 import logging
 import urllib3
 import socket
-import subprocess
-import platform
 
 # Disable SSL warnings
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
@@ -29,7 +27,7 @@ st.set_page_config(
     initial_sidebar_state="expanded"
 )
 
-# Enhanced CSS with better error styling
+# Enhanced CSS with better device control styling
 st.markdown("""
 <style>
 .metric-card {
@@ -96,6 +94,29 @@ st.markdown("""
     font-weight: 600;
 }
 
+.device-button:disabled {
+    opacity: 0.6;
+    cursor: not-allowed;
+}
+
+.auto-mode-active {
+    background: linear-gradient(135deg, #28a745 0%, #20c997 100%);
+    color: white;
+    padding: 10px;
+    border-radius: 8px;
+    text-align: center;
+    font-weight: bold;
+}
+
+.manual-mode-active {
+    background: linear-gradient(135deg, #dc3545 0%, #fd7e14 100%);
+    color: white;
+    padding: 10px;
+    border-radius: 8px;
+    text-align: center;
+    font-weight: bold;
+}
+
 .debug-panel {
     background-color: #f8f9fa;
     border: 1px solid #e9ecef;
@@ -144,9 +165,9 @@ class Config:
         "10.0.0.100",      # Some routers
     ]
     ESP32_IP = os.getenv("ESP32_IP", "172.30.247.230")
-    REFRESH_INTERVAL = int(os.getenv("REFRESH_INTERVAL", "3"))  # Faster refresh
-    CONNECTION_TIMEOUT = int(os.getenv("CONNECTION_TIMEOUT", "5"))  # Shorter timeout for tests
-    MAX_RETRIES = int(os.getenv("MAX_RETRIES", "2"))  # Fewer retries for faster testing
+    REFRESH_INTERVAL = int(os.getenv("REFRESH_INTERVAL", "3"))
+    CONNECTION_TIMEOUT = int(os.getenv("CONNECTION_TIMEOUT", "5"))
+    MAX_RETRIES = int(os.getenv("MAX_RETRIES", "2"))
     HISTORICAL_DATA_LIMIT = int(os.getenv("HISTORICAL_DATA_LIMIT", "200"))
     DEBUG_MODE = os.getenv("DEBUG_MODE", "true").lower() == "true"
     AUTO_DISCOVER = os.getenv("AUTO_DISCOVER", "true").lower() == "true"
@@ -174,7 +195,7 @@ def add_debug_info(message):
     """Add debug information with timestamp"""
     timestamp = datetime.now().strftime('%H:%M:%S')
     st.session_state.debug_info.append(f"[{timestamp}] {message}")
-    if len(st.session_state.debug_info) > 50:  # Keep last 50 entries
+    if len(st.session_state.debug_info) > 50:
         st.session_state.debug_info.pop(0)
     if Config.DEBUG_MODE:
         logger.info(message)
@@ -182,7 +203,6 @@ def add_debug_info(message):
 def test_single_ip(ip_address, timeout=3):
     """Test a single IP address for ESP32 connectivity"""
     try:
-        # First, test basic connectivity
         sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         sock.settimeout(timeout)
         result = sock.connect_ex((ip_address, 80))
@@ -191,7 +211,6 @@ def test_single_ip(ip_address, timeout=3):
         if result != 0:
             return False, "Port 80 not accessible"
         
-        # Then test HTTP endpoint
         url = f"http://{ip_address}/api/test"
         response = requests.get(url, timeout=timeout, verify=False)
         
@@ -252,7 +271,6 @@ class EnhancedRoomControlAPI:
             'Accept': 'application/json',
             'Content-Type': 'application/json'
         })
-        # Disable SSL verification for local networks
         self.session.verify = False
         
     def _make_request(self, method: str, endpoint: str, **kwargs):
@@ -267,7 +285,6 @@ class EnhancedRoomControlAPI:
                 response = self.session.request(method, url, timeout=self.timeout, **kwargs)
                 response_time = (time.time() - start_time) * 1000
                 
-                # Update metrics
                 metrics = st.session_state.performance_metrics
                 if metrics['avg_response_time'] == 0:
                     metrics['avg_response_time'] = response_time
@@ -318,7 +335,7 @@ class EnhancedRoomControlAPI:
         if response:
             try:
                 data = response.json()
-                add_debug_info(f"📊 Status: occupied={data.get('occupied', False)}, confidence={data.get('confidence', 0)}")
+                add_debug_info(f"📊 Status: occupied={data.get('occupied', False)}, confidence={data.get('confidence', 0)}, auto_mode={data.get('devices', {}).get('auto_mode', True)}")
                 return data
             except json.JSONDecodeError as e:
                 add_debug_info(f"💥 JSON decode error: {e}")
@@ -368,122 +385,62 @@ def create_gauge(value: float, title: str, max_val: float = 100, color: str = "#
     fig.update_layout(height=250, margin=dict(l=30, r=30, t=50, b=30))
     return fig
 
-def display_debug_panel():
-    """Display debug information panel"""
-    with st.expander("🔧 Debug Information", expanded=Config.DEBUG_MODE):
-        st.subheader("IP Discovery Results")
-        
-        if st.session_state.ip_test_results:
-            for ip, result in st.session_state.ip_test_results.items():
-                status_class = "ip-success" if result['success'] else "ip-failed"
-                status_icon = "✅" if result['success'] else "❌"
-                
-                st.markdown(f'''
-                <div class="ip-test-result {status_class}">
-                    {status_icon} <strong>{ip}</strong> - {result['message']}
-                    <small style="float: right;">{result['tested_at'].strftime('%H:%M:%S')}</small>
-                </div>
-                ''', unsafe_allow_html=True)
-        
-        st.subheader("Recent Activity Log")
-        if st.session_state.debug_info:
-            debug_text = "\n".join(st.session_state.debug_info[-20:])  # Show last 20 entries
-            st.markdown(f'''
-            <div class="debug-panel">
-{debug_text}
-            </div>
-            ''', unsafe_allow_html=True)
-        
-        st.subheader("Network Diagnostics")
-        col1, col2, col3 = st.columns(3)
-        
-        with col1:
-            if st.button("🔍 Rediscover IPs"):
-                with st.spinner("Scanning for ESP32..."):
-                    discovered = discover_esp32_ip()
-                    if discovered:
-                        st.success(f"Found ESP32 at {discovered}")
-                        st.rerun()
-                    else:
-                        st.error("No ESP32 found")
-        
-        with col2:
-            if st.button("🧪 Test Current IP"):
-                ip = Config.ESP32_IP
-                with st.spinner(f"Testing {ip}..."):
-                    success, message = test_single_ip(ip)
-                    if success:
-                        st.success(f"✅ {ip}: {message}")
-                    else:
-                        st.error(f"❌ {ip}: {message}")
-        
-        with col3:
-            if st.button("🗑️ Clear Debug Log"):
-                st.session_state.debug_info = []
-                st.session_state.ip_test_results = {}
-                st.success("Debug log cleared")
-
-def display_connection_status():
-    """Enhanced connection status display"""
-    status_info = {
-        'connected': {'icon': '🟢', 'text': 'Connected', 'class': 'connection-connected'},
-        'disconnected': {'icon': '🔴', 'text': 'Disconnected', 'class': 'connection-disconnected'},
-        'timeout': {'icon': '🟡', 'text': 'Timeout', 'class': 'connection-disconnected'},
-        'error': {'icon': '🟠', 'text': 'Error', 'class': 'connection-disconnected'},
-        'unknown': {'icon': '⚪', 'text': 'Unknown', 'class': 'connection-disconnected'}
-    }
-    
-    status = st.session_state.connection_status
-    info = status_info.get(status, status_info['unknown'])
-    
-    st.sidebar.markdown(f'''
-    <div class="connection-status {info['class']}">
-        {info['icon']} <strong>{info['text']}</strong>
-    </div>
-    ''', unsafe_allow_html=True)
-    
-    # Show current IP
-    current_ip = st.session_state.discovered_ip or Config.ESP32_IP
-    st.sidebar.info(f"Current IP: {current_ip}")
-    
-    if st.session_state.error_count > 0:
-        st.sidebar.error(f"Errors: {st.session_state.error_count}")
-    
-    if st.session_state.last_successful_connection:
-        last_conn = st.session_state.last_successful_connection
-        st.sidebar.success(f"Last success: {last_conn.strftime('%H:%M:%S')}")
-    
-    # Performance metrics
-    metrics = st.session_state.performance_metrics
-    if metrics['avg_response_time'] > 0:
-        st.sidebar.metric("Avg Response", f"{metrics['avg_response_time']:.0f}ms")
-
 def display_device_controls(api, devices):
-    st.subheader("Device Control Panel")
+    st.subheader("🎛️ Device Control Panel")
+    
+    # Get current states from the API response
+    auto_mode = devices.get('auto_mode', True)
+    light_state = devices.get('light', False)
+    fan_state = devices.get('fan', False) 
+    ac_state = devices.get('ac', False)
+    
+    # Display current mode with clear visual indication
+    mode_class = "auto-mode-active" if auto_mode else "manual-mode-active"
+    mode_text = "AUTO MODE ACTIVE 🤖" if auto_mode else "MANUAL MODE ACTIVE 👤"
+    st.markdown(f'<div class="{mode_class}">{mode_text}</div>', unsafe_allow_html=True)
+    
+    if auto_mode:
+        st.info("🔒 Devices are automatically controlled. Switch to Manual mode to enable manual control.")
     
     device_config = [
-        {'key': 'light', 'icon': '💡', 'name': 'Light', 'endpoint': 'light'},
-        {'key': 'fan', 'icon': '🌪️', 'name': 'Fan', 'endpoint': 'fan'},
-        {'key': 'ac', 'icon': '❄️', 'name': 'AC', 'endpoint': 'ac'},
-        {'key': 'auto_mode', 'icon': '🤖', 'name': 'Auto Mode', 'endpoint': 'auto'}
+        {'key': 'light', 'icon': '💡', 'name': 'Light', 'endpoint': 'light', 'state': light_state},
+        {'key': 'fan', 'icon': '🌪️', 'name': 'Fan', 'endpoint': 'fan', 'state': fan_state},
+        {'key': 'ac', 'icon': '❄️', 'name': 'AC', 'endpoint': 'ac', 'state': ac_state},
+        {'key': 'auto_mode', 'icon': '🤖', 'name': 'Auto Mode', 'endpoint': 'auto', 'state': auto_mode}
     ]
     
     cols = st.columns(2)
     
     for i, device in enumerate(device_config):
         with cols[i % 2]:
-            device_state = devices.get(device['key'], False)
-            status_text = "ON" if device_state else "OFF"
-            button_type = "primary" if device_state else "secondary"
+            device_state = device['state']
             
-            if st.button(f"{device['icon']} {device['name']} ({status_text})", 
+            if device['key'] == 'auto_mode':
+                # Auto mode toggle button
+                button_text = f"{'👤 Switch to MANUAL' if device_state else '🤖 Switch to AUTO'}"
+                button_type = "primary"
+                disabled = False
+            else:
+                # Device toggle buttons
+                status_text = "ON" if device_state else "OFF"
+                button_text = f"{device['icon']} {device['name']} ({status_text})"
+                button_type = "primary" if device_state else "secondary"
+                # Disable device buttons when in auto mode
+                disabled = auto_mode
+            
+            if disabled:
+                button_text += " 🔒"
+            
+            if st.button(button_text, 
                         key=f"{device['key']}_btn", 
                         use_container_width=True,
-                        type=button_type):
+                        type=button_type,
+                        disabled=disabled and device['key'] != 'auto_mode'):
                 with st.spinner(f'Toggling {device["name"]}...'):
                     add_debug_info(f"User toggling {device['name']}")
                     if api.toggle_device(device['endpoint']):
-                        st.success(f"{device['name']} toggled!")
+                        st.success(f"{device['name']} toggled successfully!")
+                        # Update session state
                         st.session_state.device_states[device['key']] = not device_state
                         add_debug_info(f"✅ {device['name']} toggled successfully")
                         time.sleep(1)
@@ -491,6 +448,90 @@ def display_device_controls(api, devices):
                     else:
                         st.error(f"Failed to toggle {device['name']}")
                         add_debug_info(f"❌ Failed to toggle {device['name']}")
+
+def display_main_dashboard(status_data, api):
+    # Get device states
+    devices = status_data.get('devices', {})
+    auto_mode = devices.get('auto_mode', True)
+    light_state = devices.get('light', False)
+    fan_state = devices.get('fan', False)
+    ac_state = devices.get('ac', False)
+    
+    # Main status with enhanced display
+    col1, col2, col3, col4, col5 = st.columns([2, 1, 1, 1, 1])
+    
+    with col1:
+        is_occupied = status_data.get('occupied', False)
+        confidence = status_data.get('confidence', 0)
+        occupancy_level = status_data.get('occupancy_level', 0)
+        
+        # Enhanced status display with occupancy level
+        if occupancy_level == 3:
+            status_text = "OCCUPIED"
+            status_class = "status-occupied"
+        elif occupancy_level == 2:
+            status_text = "LIKELY OCCUPIED"
+            status_class = "status-occupied"
+        elif occupancy_level == 1:
+            status_text = "MAYBE OCCUPIED"
+            status_class = "status-vacant"
+        else:
+            status_text = "VACANT"
+            status_class = "status-vacant"
+            
+        st.markdown(f'''
+        <div class="{status_class}">
+            <h2>{status_text}</h2>
+            <p>Confidence: {confidence}/10</p>
+            <p>Level: {occupancy_level}/3</p>
+            <p>Mode: {'AUTO' if auto_mode else 'MANUAL'}</p>
+        </div>
+        ''', unsafe_allow_html=True)
+    
+    with col2:
+        light_level = status_data.get('light_level', 0)
+        status_icon = "💡" if light_state else "⚫"
+        status_color = "🟢" if light_state else "⚫"
+        st.metric(f"{status_icon} Light", f"{light_level:.0f} lux", status_color)
+
+    with col3:
+        radar_distance = status_data.get('radar_distance', 0)
+        st.metric("📡 Radar", f"{radar_distance} cm")
+    
+    with col4:
+        ir_count = status_data.get('ir_count', 0)
+        st.metric("🚶 IR Events", ir_count)
+    
+    with col5:
+        mode_icon = "🤖" if auto_mode else "👤"
+        mode_status = "AUTO" if auto_mode else "MANUAL"
+        st.metric(f"{mode_icon} Mode", mode_status)
+    
+    # Device controls with proper state
+    display_device_controls(api, devices)
+    
+    # Gauges with better layout
+    st.subheader("📊 Real-time Metrics")
+    col1, col2, col3, col4 = st.columns(4)
+    
+    with col1:
+        fig = create_gauge(confidence, "Confidence", 10, "#66bb6a", "/10")
+        st.plotly_chart(fig, use_container_width=True)
+    
+    with col2:
+        light_level = min(status_data.get('light_level', 0), 1000)
+        fig = create_gauge(light_level, "Light Level", 1000, "#ffa726", "lux")
+        st.plotly_chart(fig, use_container_width=True)
+    
+    with col3:
+        radar_dist = min(status_data.get('radar_distance', 0), 600)
+        fig = create_gauge(radar_dist, "Radar Distance", 600, "#42a5f5", "cm")
+        st.plotly_chart(fig, use_container_width=True)
+    
+    with col4:
+        ir_count = min(status_data.get('ir_count', 0), 50)
+        fig = create_gauge(ir_count, "IR Count", 50, "#ab47bc", "events")
+        st.plotly_chart(fig, use_container_width=True)
 
 def display_charts():
     if len(st.session_state.historical_data) <= 2:
@@ -500,7 +541,6 @@ def display_charts():
     st.subheader("📈 Historical Data")
     df = pd.DataFrame(st.session_state.historical_data)
     
-    # Time range selector
     col1, col2 = st.columns([3, 1])
     with col1:
         time_range = st.selectbox("Time Range", ["Last 30 minutes", "Last 1 Hour", "Last 4 Hours", "All Data"], index=1)
@@ -528,7 +568,6 @@ def display_charts():
         subplot_titles=('Occupancy Status', 'Light Level (lux)', 'Detection Confidence', 'Radar Distance (cm)')
     )
     
-    # Occupancy
     occupancy_y = filtered_df['occupied'].astype(int)
     fig.add_trace(go.Scatter(
         x=filtered_df['timestamp'], 
@@ -539,7 +578,6 @@ def display_charts():
         fill='tonexty'
     ), row=1, col=1)
     
-    # Light level
     fig.add_trace(go.Scatter(
         x=filtered_df['timestamp'], 
         y=filtered_df['light_level'], 
@@ -548,7 +586,6 @@ def display_charts():
         line=dict(color='#ffa726', width=2)
     ), row=1, col=2)
     
-    # Confidence
     fig.add_trace(go.Scatter(
         x=filtered_df['timestamp'], 
         y=filtered_df['confidence'], 
@@ -557,7 +594,6 @@ def display_charts():
         line=dict(color='#66bb6a', width=2)
     ), row=2, col=1)
     
-    # Radar distance
     fig.add_trace(go.Scatter(
         x=filtered_df['timestamp'], 
         y=filtered_df['radar_distance'], 
@@ -601,81 +637,91 @@ def display_system_health(health_data, status_data):
         requests = combined_data.get('total_requests', 0)
         st.metric("API Calls", f"{requests}")
 
-def display_main_dashboard(status_data, api):
-    # Main status with enhanced display
-    col1, col2, col3, col4, col5 = st.columns([2, 1, 1, 1, 1])
+def display_connection_status():
+    status_info = {
+        'connected': {'icon': '🟢', 'text': 'Connected', 'class': 'connection-connected'},
+        'disconnected': {'icon': '🔴', 'text': 'Disconnected', 'class': 'connection-disconnected'},
+        'timeout': {'icon': '🟡', 'text': 'Timeout', 'class': 'connection-disconnected'},
+        'error': {'icon': '🟠', 'text': 'Error', 'class': 'connection-disconnected'},
+        'unknown': {'icon': '⚪', 'text': 'Unknown', 'class': 'connection-disconnected'}
+    }
     
-    with col1:
-        is_occupied = status_data.get('occupied', False)
-        confidence = status_data.get('confidence', 0)
-        occupancy_level = status_data.get('occupancy_level', 0)
+    status = st.session_state.connection_status
+    info = status_info.get(status, status_info['unknown'])
+    
+    st.sidebar.markdown(f'''
+    <div class="connection-status {info['class']}">
+        {info['icon']} <strong>{info['text']}</strong>
+    </div>
+    ''', unsafe_allow_html=True)
+    
+    current_ip = st.session_state.discovered_ip or Config.ESP32_IP
+    st.sidebar.info(f"Current IP: {current_ip}")
+    
+    if st.session_state.error_count > 0:
+        st.sidebar.error(f"Errors: {st.session_state.error_count}")
+    
+    if st.session_state.last_successful_connection:
+        last_conn = st.session_state.last_successful_connection
+        st.sidebar.success(f"Last success: {last_conn.strftime('%H:%M:%S')}")
+    
+    metrics = st.session_state.performance_metrics
+    if metrics['avg_response_time'] > 0:
+        st.sidebar.metric("Avg Response", f"{metrics['avg_response_time']:.0f}ms")
+
+def display_debug_panel():
+    with st.expander("🔧 Debug Information", expanded=Config.DEBUG_MODE):
+        st.subheader("IP Discovery Results")
         
-        # Enhanced status display with occupancy level
-        if occupancy_level == 3:
-            status_text = "OCCUPIED"
-            status_class = "status-occupied"
-        elif occupancy_level == 2:
-            status_text = "LIKELY OCCUPIED"
-            status_class = "status-occupied"
-        elif occupancy_level == 1:
-            status_text = "MAYBE OCCUPIED"
-            status_class = "status-vacant"
-        else:
-            status_text = "VACANT"
-            status_class = "status-vacant"
-            
-        st.markdown(f'''
-        <div class="{status_class}">
-            <h2>{status_text}</h2>
-            <p>Confidence: {confidence}/10</p>
-            <p>Level: {occupancy_level}/3</p>
-        </div>
-        ''', unsafe_allow_html=True)
-    
-    with col2:
-        light_level = status_data.get('light_level', 0)
-        st.metric("💡 Light Level", f"{light_level:.0f} lux")
-    
-    with col3:
-        radar_distance = status_data.get('radar_distance', 0)
-        st.metric("📡 Radar", f"{radar_distance} cm")
-    
-    with col4:
-        ir_count = status_data.get('ir_count', 0)
-        st.metric("🚶 IR Events", ir_count)
-    
-    with col5:
-        auto_mode = status_data.get('devices', {}).get('auto_mode', True)
-        mode_color = "🤖" if auto_mode else "👤"
-        st.metric(f"{mode_color} Mode", "AUTO" if auto_mode else "MANUAL")
-    
-    # Device controls
-    display_device_controls(api, status_data.get('devices', {}))
-    
-    # Gauges with better layout
-    st.subheader("📊 Real-time Metrics")
-    col1, col2, col3, col4 = st.columns(4)
-    
-    with col1:
-        fig = create_gauge(confidence, "Confidence", 10, "#66bb6a", "/10")
-        st.plotly_chart(fig, use_container_width=True)
-    
-    with col2:
-        light_level = min(status_data.get('light_level', 0), 1000)
-        fig = create_gauge(light_level, "Light Level", 1000, "#ffa726", "lux")
-        st.plotly_chart(fig, use_container_width=True)
-    
-    with col3:
-        radar_dist = min(status_data.get('radar_distance', 0), 600)
-        fig = create_gauge(radar_dist, "Radar Distance", 600, "#42a5f5", "cm")
-        st.plotly_chart(fig, use_container_width=True)
-    
-    with col4:
-        ir_count = min(status_data.get('ir_count', 0), 50)
-        fig = create_gauge(ir_count, "IR Count", 50, "#ab47bc", "events")
-        st.plotly_chart(fig, use_container_width=True)
-
-
+        if st.session_state.ip_test_results:
+            for ip, result in st.session_state.ip_test_results.items():
+                status_class = "ip-success" if result['success'] else "ip-failed"
+                status_icon = "✅" if result['success'] else "❌"
+                
+                st.markdown(f'''
+                <div class="ip-test-result {status_class}">
+                    {status_icon} <strong>{ip}</strong> - {result['message']}
+                    <small style="float: right;">{result['tested_at'].strftime('%H:%M:%S')}</small>
+                </div>
+                ''', unsafe_allow_html=True)
+        
+        st.subheader("Recent Activity Log")
+        if st.session_state.debug_info:
+            debug_text = "\n".join(st.session_state.debug_info[-20:])
+            st.markdown(f'''
+            <div class="debug-panel">
+{debug_text}
+            </div>
+            ''', unsafe_allow_html=True)
+        
+        st.subheader("Network Diagnostics")
+        col1, col2, col3 = st.columns(3)
+        
+        with col1:
+            if st.button("🔍 Rediscover IPs"):
+                with st.spinner("Scanning for ESP32..."):
+                    discovered = discover_esp32_ip()
+                    if discovered:
+                        st.success(f"Found ESP32 at {discovered}")
+                        st.rerun()
+                    else:
+                        st.error("No ESP32 found")
+        
+        with col2:
+            if st.button("🧪 Test Current IP"):
+                ip = Config.ESP32_IP
+                with st.spinner(f"Testing {ip}..."):
+                    success, message = test_single_ip(ip)
+                    if success:
+                        st.success(f"✅ {ip}: {message}")
+                    else:
+                        st.error(f"❌ {ip}: {message}")
+        
+        with col3:
+            if st.button("🗑️ Clear Debug Log"):
+                st.session_state.debug_info = []
+                st.session_state.ip_test_results = {}
+                st.success("Debug log cleared")
 
 def main():
     st.markdown("""
@@ -710,6 +756,9 @@ def main():
         if st.button("Clear History"):
             st.session_state.historical_data = []
             st.success("History cleared!")
+        
+        if Config.DEBUG_MODE:
+            display_debug_panel()
     
     # Main content
     api = EnhancedRoomControlAPI(Config.ESP32_IP)
@@ -737,7 +786,10 @@ def main():
         
         # Display dashboard
         display_main_dashboard(status_data, api)
-        display_system_health(None, status_data)
+        
+        # Display system health and charts
+        health_data = status_data.get('health', {})
+        display_system_health(health_data, status_data)
         display_charts()
         
         st.caption(f"Last update: {timestamp.strftime('%H:%M:%S')}")
@@ -751,6 +803,16 @@ def main():
             <p>Check: IP address, WiFi connection, and power</p>
         </div>
         ''', unsafe_allow_html=True)
+        
+        if st.button("Try Auto-Discovery"):
+            with st.spinner("Discovering ESP32..."):
+                discovered_ip = discover_esp32_ip()
+                if discovered_ip:
+                    st.success(f"Found ESP32 at {discovered_ip}! Updating configuration...")
+                    Config.ESP32_IP = discovered_ip
+                    st.rerun()
+                else:
+                    st.error("No ESP32 found on network")
     
     # Auto-refresh
     if st.session_state.connection_status == 'connected':
