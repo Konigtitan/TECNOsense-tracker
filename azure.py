@@ -164,7 +164,7 @@ class Config:
         "192.168.0.100",   # Common router range
         "10.0.0.100",      # Some routers
     ]
-    ESP32_IP = os.getenv("ESP32_IP", "172.30.247.230")
+    ESP32_IP = os.getenv("ESP32_IP", "172.30.247.239") #DEPENDS on board
     REFRESH_INTERVAL = int(os.getenv("REFRESH_INTERVAL", "3"))
     CONNECTION_TIMEOUT = int(os.getenv("CONNECTION_TIMEOUT", "5"))
     MAX_RETRIES = int(os.getenv("MAX_RETRIES", "2"))
@@ -821,3 +821,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
